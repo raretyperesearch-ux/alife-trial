@@ -1,0 +1,14 @@
+{
+  "name": "alife-trial",
+  "version": "0.1.0",
+  "description": "ALiFe 500-cycle trial — one agent, curiosity engine, no sleep",
+  "type": "module",
+  "scripts": {
+    "start": "node runtime.js",
+    "once": "node runtime.js --once"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.1"
+  }
+}
