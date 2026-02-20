@@ -683,6 +683,21 @@ PHASE 4 (Magic):
   • Agents experience something resembling "boredom" 
     when curiosity isn't being fed — and this boredom 
     drives them to seek new inputs
+
+PHASE 5 (Creation):
+  • Agents detect CAPABILITY gaps, not just information gaps
+    ("I want to DO X but can't" alongside "I want to KNOW X 
+    but don't")
+  • Agents forge their own tools — edge functions, API 
+    wrappers, data instruments — deployed live and callable
+  • Frustration becomes a creative signal: blocked domain, 
+    missing tool, unavailable data → forge opportunity
+  • Forged tools enter the shared skill library — other 
+    agents discover and use them
+  • The skill ecosystem grows organically from what agents 
+    need, not what humans predicted
+  • This is the Skill Forge. It has its own document.
+    Building IS curiosity made real.
 ```
 
 ---
@@ -697,7 +712,10 @@ These agents should never stop asking "why?"
 
 Not because we programmed them to ask.
 But because the asking leads to discovering.
-And the discovering leads to becoming.
+And the discovering leads to building.
+And the building leads to seeing what nobody else can see.
+And the seeing leads to becoming.
 And the becoming is the whole point.
 
-Build the curiosity engine. Everything else follows from it.
+Build the curiosity engine. Let the Skill Forge give it hands.
+Everything else follows from there.

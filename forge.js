@@ -1,5 +1,6 @@
 // forge.js — Skill Forge for ALiFe v2
 // Handles: gap detection → planning → building → deploying → testing
+// Now with REAL deployment via forge-deployer edge function
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -36,64 +37,57 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
           return { success: false, reason: safetyCheck.reason };
         }
 
-        // Deploy via Supabase Management API
-        const funcName = `agent-${skill_id}`;
-        const deployed = await deployFunction(funcName, code);
+        // Deploy via forge-deployer edge function (REAL DEPLOYMENT)
+        const funcName = `forged-${skill_id}`;
+        const deployed = await deployFunction(agentId, skill_id, name, description, code, env_vars_needed);
 
         if (deployed.success) {
-          // Register skill
-          await supabase.from('skills').upsert({
-            id: skill_id,
-            name: name || skill_id,
-            description: description || '',
-            domain: 'forged',
-            full_doc: code,
-            forged: true,
-            created_by: agentId,
-            created_at_cycle: cycleNumber,
-            implementation_type: 'edge_function',
+          await logForgeEvent(agentId, label, cycleNumber, 'deployed', {
             function_name: funcName,
-            word_count: code.split(' ').length,
-          }, { onConflict: 'id' });
-
-          // Store in agent edge functions
-          await supabase.from('agent_edge_functions').insert({
-            agent_id: agentId,
-            skill_id,
-            function_name: funcName,
-            code,
-            status: 'active',
-            env_vars_needed: env_vars_needed || [],
+            callable_url: deployed.callable_url,
+            code_length: code.length,
           });
+
+          console.log(`  ✅ FORGED: ${funcName} deployed`);
+          console.log(`  🔗 Callable at: ${deployed.callable_url}`);
 
           // Update agent forged count
           try {
             await supabase.rpc('increment_forged_count', { aid: agentId });
           } catch {
-            // RPC doesn't exist, skip
+            // RPC doesn't exist, update directly
+            const { data: agent } = await supabase.from('agents').select('forged_skill_count').eq('id', agentId).single();
+            if (agent) {
+              await supabase.from('agents').update({ forged_skill_count: (agent.forged_skill_count || 0) + 1 }).eq('id', agentId);
+            }
           }
-
-          await logForgeEvent(agentId, label, cycleNumber, 'deployed', {
-            function_name: funcName,
-            code_length: code.length,
-          });
-
-          console.log(`  ✅ FORGED: ${funcName} deployed`);
 
           // Run test if provided
           if (test) {
-            const testResult = await testFunction(funcName, test);
+            const testResult = await testFunction(skill_id, test);
             await logForgeEvent(agentId, label, cycleNumber,
               testResult.passed ? 'test_passed' : 'test_failed', testResult);
             console.log(`  🧪 Test: ${testResult.passed ? 'PASSED' : 'FAILED'}`);
           }
 
-          return { success: true, function_name: funcName };
+          return { success: true, function_name: funcName, callable_url: deployed.callable_url };
         } else {
           await logForgeEvent(agentId, label, cycleNumber, 'deploy_failed', deployed);
           console.log(`  ❌ Deploy failed: ${deployed.error}`);
           return { success: false, reason: deployed.error };
         }
+      }
+
+      case 'invoke_forged': {
+        // Call a previously forged function
+        const { target_skill, input } = forgeAction;
+        if (!target_skill) return { success: false, reason: 'no target_skill' };
+        
+        const result = await invokeForgedFunction(target_skill, input || {});
+        await logForgeEvent(agentId, label, cycleNumber, result.success ? 'invoke_success' : 'invoke_failed', {
+          target_skill, result: JSON.stringify(result).slice(0, 500),
+        });
+        return result;
       }
 
       case 'create_table': {
@@ -118,14 +112,17 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       }
 
       case 'call_api': {
-        // Agent wants to call an external API it's discovered
         const { url, method, headers, body } = forgeAction.api_call || {};
         if (!url) return { success: false, reason: 'no url' };
 
-        // Safety: whitelist domains
         if (!isAllowedDomain(url)) {
           console.log(`  🚫 Domain not allowed: ${url}`);
-          return { success: false, reason: 'domain not allowed' };
+          // FORGE HINT: suggest building an edge function wrapper
+          return { 
+            success: false, 
+            reason: 'domain not allowed',
+            forge_hint: `Domain ${new URL(url).hostname} is not in the allowlist. You can forge an edge function that wraps this API — deploy it via deploy_edge_function and then call it through invoke_forged.`,
+          };
         }
 
         try {
@@ -143,16 +140,13 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       }
 
       case 'post_bounty': {
-        // Agent wants to post a bounty for human help
         const { task, payment, platform } = forgeAction.bounty || {};
         await logForgeEvent(agentId, label, cycleNumber, 'bounty_posted', { task, payment, platform });
-        // For now, just log it. Real posting comes with Farcaster integration
         console.log(`  📋 Bounty logged: "${task}" (${payment})`);
         return { success: true, logged: true, note: 'Bounty logged, Farcaster posting not yet active' };
       }
 
       case 'search_github': {
-        // Agent wants to find open source tools
         const { query } = forgeAction;
         if (!query) return { success: false, reason: 'no query' };
 
@@ -181,7 +175,6 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       case 'push_files':
       case 'push_file':
       case 'create_repo': {
-        // Route to github handler
         const { handleGitHub } = await import('./github.js');
         const result = await handleGitHub(agentId, cycleNumber, forgeAction);
         await logForgeEvent(agentId, label, cycleNumber, 'github_push', result);
@@ -192,54 +185,41 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       case 'execute_deployment':
       case 'deploy_railway':
       case 'deploy_production': {
-        // Mira wants to trigger a deployment
-        // For Railway: redeploy via webhook or API
-        const railwayToken = process.env.RAILWAY_API_TOKEN;
-        const railwayServiceId = forgeAction.service_id || process.env.RAILWAY_SERVICE_ID;
-        const railwayEnvironmentId = forgeAction.environment_id || process.env.RAILWAY_ENVIRONMENT_ID;
-        const target = forgeAction.target || forgeAction.repo || 'unknown';
-
-        if (railwayToken && railwayServiceId) {
-          try {
-            // Railway GraphQL API to trigger redeploy
-            const resp = await fetch('https://backboard.railway.app/graphql/v2', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${railwayToken}`,
-              },
-              body: JSON.stringify({
-                query: `mutation { serviceInstanceRedeploy(serviceId: "${railwayServiceId}"${railwayEnvironmentId ? `, environmentId: "${railwayEnvironmentId}"` : ''}) }`,
-              }),
-            });
-            const data = await resp.json();
-
-            if (data.errors) {
-              console.log(`  ❌ Railway deploy failed: ${data.errors[0].message}`);
-              await logForgeEvent(agentId, label, cycleNumber, 'deploy_failed', { target, error: data.errors[0].message });
-              return { success: false, reason: data.errors[0].message };
-            }
-
-            console.log(`  ✅ Railway redeploy triggered for ${target}`);
-            await logForgeEvent(agentId, label, cycleNumber, 'deploy_triggered', { target });
-            return { success: true, target, note: 'Railway redeploy triggered. It may take 1-2 minutes to go live.' };
-          } catch (e) {
-            console.log(`  ❌ Railway deploy error: ${e.message}`);
-            return { success: false, reason: e.message };
-          }
+        // Railway deployment
+        const token = process.env.RAILWAY_API_TOKEN;
+        if (!token) {
+          await logForgeEvent(agentId, label, cycleNumber, 'deploy_intent', { 
+            note: 'No Railway token. Push to GitHub for auto-deploy.' 
+          });
+          return { success: false, reason: 'No Railway API token. Push to the connected GitHub repo to trigger auto-deploy.' };
         }
-
-        // Fallback: no Railway token configured — log intent and guide Mira
-        console.log(`  ⚠ Deploy requested but no RAILWAY_API_TOKEN configured. Logging intent.`);
-        await logForgeEvent(agentId, label, cycleNumber, 'deploy_requested', {
-          target,
-          note: 'No Railway API token. Push code to GitHub and Railway auto-deploys from the repo.',
-        });
-        return {
-          success: true,
-          logged: true,
-          note: 'Deploy intent logged. To auto-deploy: push code to GitHub → Railway auto-deploys from the connected repo. Or set RAILWAY_API_TOKEN + RAILWAY_SERVICE_ID env vars for direct deploy.',
+        
+        const serviceMap = {
+          'alife-trial': process.env.RAILWAY_SERVICE_ID_ALIFE,
+          'conway-manager': process.env.RAILWAY_SERVICE_ID_CONWAY,
         };
+        const target = forgeAction.target || 'alife-trial';
+        const serviceId = serviceMap[target] || target;
+        const envId = process.env.RAILWAY_ENVIRONMENT_ID;
+
+        try {
+          const resp = await fetch('https://backboard.railway.app/graphql/v2', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: `mutation { serviceInstanceRedeploy(serviceId: "${serviceId}", environmentId: "${envId}") }`,
+            }),
+          });
+          const data = await resp.json();
+          if (data.errors) {
+            return { success: false, reason: data.errors[0].message };
+          }
+          await logForgeEvent(agentId, label, cycleNumber, 'railway_deployed', { target, serviceId });
+          console.log(`  🚂 Railway deploy triggered: ${target}`);
+          return { success: true, target, note: 'Deployment triggered. Takes 1-2 minutes.' };
+        } catch (e) {
+          return { success: false, reason: e.message };
+        }
       }
 
       default:
@@ -254,38 +234,72 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
 }
 
 /**
- * Deploy an edge function to Supabase
+ * Deploy an edge function via the forge-deployer edge function (REAL)
  */
-async function deployFunction(name, code) {
-  // Wrap code in standard Deno.serve pattern if not already
+async function deployFunction(agentId, skillId, name, description, code, envVarsNeeded) {
+  // Ensure the code follows the callable pattern
   let finalCode = code;
-  if (!code.includes('Deno.serve')) {
-    finalCode = `import "jsr:@supabase/functions-js/edge-runtime.d.ts";\n\n${code}`;
+  if (!code.includes('Deno.serve') && !code.includes('export default')) {
+    // Wrap in the standard callable handler pattern
+    finalCode = `// Forged by agent: ${agentId}
+// Skill: ${skillId} — ${name || ''}
+// ${description || ''}
+
+export default async function(input, ctx) {
+${code}
+}`;
   }
 
   try {
-    // Use Supabase Management API to deploy
-    // For now, store the code and mark as ready — manual deploy needed
-    // TODO: Use Supabase CLI or Management API for auto-deploy
-    return { success: true, note: 'Code stored, auto-deploy pending CLI integration' };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
-async function testFunction(funcName, testInput) {
-  try {
-    const url = `${SUPA_URL}/functions/v1/${funcName}`;
-    const resp = await fetch(url, {
+    const resp = await fetch(`${SUPA_URL}/functions/v1/forge-deployer`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${SUPA_SERVICE_KEY}`,
       },
-      body: JSON.stringify(testInput),
+      body: JSON.stringify({
+        action: 'deploy',
+        skill_id: skillId,
+        name,
+        description,
+        code: finalCode,
+        agent_id: agentId,
+        env_vars_needed: envVarsNeeded || [],
+      }),
     });
-    const data = await resp.json().catch(() => ({}));
-    return { passed: resp.ok, status: resp.status, data };
+
+    const data = await resp.json();
+    return data;
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Invoke a forged function
+ */
+async function invokeForgedFunction(skillId, input) {
+  try {
+    const resp = await fetch(`${SUPA_URL}/functions/v1/forge-invoke?skill=${skillId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPA_SERVICE_KEY}`,
+      },
+      body: JSON.stringify(input),
+    });
+
+    const data = await resp.json();
+    return data;
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+async function testFunction(skillId, testInput) {
+  try {
+    const result = await invokeForgedFunction(skillId, testInput);
+    return { passed: result.success, ...result };
   } catch (e) {
     return { passed: false, error: e.message };
   }
@@ -312,7 +326,6 @@ function scanCodeSafety(code) {
     }
   }
 
-  // Size limit: 50KB of code
   if (code.length > 50000) {
     return { safe: false, reason: 'code too large (max 50KB)' };
   }
@@ -322,9 +335,7 @@ function scanCodeSafety(code) {
 
 function isSafeDDL(sql) {
   const upper = sql.toUpperCase().trim();
-  // Only allow CREATE TABLE and CREATE INDEX
   if (!upper.startsWith('CREATE TABLE') && !upper.startsWith('CREATE INDEX')) return false;
-  // Block modifications to system tables
   const systemTables = ['agents', 'skills', 'think_cycles', 'memories', 'posts', 'forge_events'];
   for (const t of systemTables) {
     if (upper.includes(t.toUpperCase())) return false;
@@ -343,7 +354,7 @@ const ALLOWED_DOMAINS = [
   'api.neynar.com',
   'api.coingecko.com',
   'api.dexscreener.com',
-  'api.openai.com', // for DALL-E if needed
+  'api.openai.com',
 ];
 
 function isAllowedDomain(url) {

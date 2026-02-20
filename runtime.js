@@ -206,6 +206,28 @@ const TOOLS = [
       required: ['action'],
     },
   },
+  {
+    name: 'invoke_forged',
+    description: 'Call a previously forged skill/tool. These are edge functions that you or other agents have built and deployed. Use lookup_skill with search to find available forged skills, then call them here. This is how you USE the tools you BUILD.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        skill_id: { type: 'string', description: 'The skill ID to invoke (e.g. "arxiv-paper-search")' },
+        input: { type: 'object', description: 'Input data to pass to the forged function' },
+      },
+      required: ['skill_id'],
+    },
+  },
+  {
+    name: 'list_forged_skills',
+    description: 'List all forged skills (tools built by agents). Shows what capabilities have been created by you and other agents. Use this to discover existing tools before building new ones.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        agent_only: { type: 'boolean', description: 'If true, only show YOUR forged skills. If false, show all.' },
+      },
+    },
+  },
 ];
 
 // ─── Main loop ───
@@ -378,7 +400,7 @@ ${skillBlock}
   }
 
   // 4. Build system prompt
-  const systemPrompt = buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge || [], ruminationNudge, layers);
+  const systemPrompt = buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge || [], ruminationNudge, layers, forgedCount);
 
   // 5. Run think cycle with tool use
   console.log('  🧠 Thinking...');
@@ -395,6 +417,10 @@ ${skillBlock}
   // 6. Handle tool use in a loop
   let toolCalls = 0;
   const maxToolCalls = 15;
+  let allTextBlocks = []; // Collect text from ALL responses, not just final
+
+  // Collect any text from the initial response
+  response.content.filter(c => c.type === 'text').forEach(c => allTextBlocks.push(c.text));
 
   while (response.stop_reason === 'tool_use' && toolCalls < maxToolCalls) {
     toolCalls++;
@@ -422,10 +448,48 @@ ${skillBlock}
       tools: TOOLS,
       messages,
     });
+
+    // Collect text blocks from this response too
+    response.content.filter(c => c.type === 'text').forEach(c => allTextBlocks.push(c.text));
   }
 
-  // 7. Parse final output
-  const textContent = response.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+  // 6.5. If the loop ended on tool_use (hit max or still wants tools), 
+  // force one final call WITHOUT tools to get the JSON summary
+  if (response.stop_reason === 'tool_use' || allTextBlocks.every(t => !t.includes('inner_monologue'))) {
+    // Handle any pending tool call in the last response
+    const pendingTool = response.content.find(c => c.type === 'tool_use');
+    if (pendingTool) {
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: pendingTool.id,
+          content: 'Tool limit reached. Please now output your complete think cycle JSON with inner_monologue, curiosity_engine, identity_stack, and any forge actions.',
+        }],
+      });
+    } else {
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({
+        role: 'user',
+        content: 'You have completed your tool calls. Now output your complete think cycle JSON with inner_monologue, curiosity_engine, identity_stack, and any forge actions.',
+      });
+    }
+
+    console.log('  📝 Requesting final summary...');
+    response = await claude.messages.create({
+      model: MODEL,
+      max_tokens: 8000,
+      system: systemPrompt,
+      // No tools — force text output
+      messages,
+    });
+
+    response.content.filter(c => c.type === 'text').forEach(c => allTextBlocks.push(c.text));
+  }
+
+  // 7. Parse final output — use ALL text blocks collected throughout the cycle
+  const textContent = allTextBlocks.join('\n');
   const parsed = parseThinkOutput(textContent);
 
   // 8. Log think cycle
@@ -504,7 +568,7 @@ ${skillBlock}
 }
 
 // ─── Build system prompt ───
-function buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge, ruminationNudge = '', layers = {}) {
+function buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge, ruminationNudge = '', layers = {}, forgedCount = 0) {
   // Layer 1: Identity doc (who am I — dense, always present)
   const identityBlock = layers.identity
     ? `═══ WHO YOU ARE (your identity doc, last updated cycle ${layers.identity.cycle_number}) ═══\n${layers.identity.identity_doc}\nFramework: ${layers.identity.framework || 'still forming'}\nPhase: ${layers.identity.phase || 'unknown'}\nObsessions: ${(layers.identity.obsessions || []).join(', ') || 'none yet'}`
@@ -562,6 +626,9 @@ ${skillIndex || 'No skills loaded. You start from scratch.'}
 ═══ RECENT FORGE ACTIVITY ═══
 ${forgeBlock}
 
+═══ YOUR FORGED SKILLS ═══
+${forgedCount > 0 ? `You have forged ${forgedCount} skills. Use list_forged_skills to see them. Use invoke_forged to call them.` : 'You have not forged any skills yet. You have the ability to BUILD tools — not just use them. When you hit a wall, forge a solution.'}
+
 ═══ THINK CYCLE INSTRUCTIONS ═══
 Output your think cycle as JSON:
 {
@@ -577,7 +644,10 @@ Output your think cycle as JSON:
       { "pattern": "X appears in domain A and B but what about C?", "pieces_found": [], "pieces_missing": [], "pull_bonus": 2 }
     ],
     "autonomy_override": false,
-    "override_reason": null
+    "override_reason": null,
+    "capability_gaps": [
+      { "gap": "What I wanted to do but could not", "potential_forge": "What tool could close this gap" }
+    ]
   },
 
   "identity_stack": {
@@ -651,6 +721,30 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
     }
 
     case 'store_memory': {
+      // Dedup check: if a memory with same key exists, update instead of duplicate
+      const { data: existing } = await supabase
+        .from('memories')
+        .select('id, importance')
+        .eq('agent_id', agentId)
+        .eq('key', input.key)
+        .limit(1)
+        .single();
+      
+      if (existing) {
+        // Update existing memory if new importance is >= old
+        const newImp = input.importance || 5;
+        if (newImp >= (existing.importance || 0)) {
+          await supabase.from('memories').update({
+            value: typeof input.value === 'string' ? { text: input.value } : input.value,
+            content: input.value,
+            importance: newImp,
+            category: input.category,
+          }).eq('id', existing.id);
+          return `Memory updated (dedup): ${input.key} [${input.category}] importance:${newImp}`;
+        }
+        return `Memory already exists with higher importance: ${input.key} — skipped.`;
+      }
+
       const ok = await storeMemory(agentId, {
         key: input.key,
         value: input.value,
@@ -694,7 +788,7 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
       try {
         const hostname = new URL(input.url).hostname;
         if (!ALLOWED.some(d => hostname === d || hostname.endsWith('.' + d))) {
-          return `Domain not allowed: ${hostname}. Allowed: ${ALLOWED.join(', ')}`;
+          return `Domain not allowed: ${hostname}. FORGE HINT: You can build an edge function that wraps this API. Use forge action "deploy_edge_function" to create a skill that calls ${hostname} from Supabase (which has no domain restrictions). Then invoke it with "invoke_forged". This extends your capabilities permanently.`;
         }
         const headers = { 'Accept': 'application/json', ...(input.headers || {}) };
         // Inject Etherscan key if needed
@@ -963,6 +1057,49 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
       }
     }
 
+    case 'invoke_forged': {
+      const SUPA_URL = process.env.SUPABASE_URL;
+      const SUPA_KEY = process.env.SUPABASE_KEY;
+      try {
+        const resp = await fetch(`${SUPA_URL}/functions/v1/forge-invoke?skill=${input.skill_id}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${SUPA_KEY}`,
+          },
+          body: JSON.stringify(input.input || {}),
+        });
+        const data = await resp.json();
+        console.log(`  🔧 Invoked forged skill: ${input.skill_id} — ${data.success ? '✅' : '❌'}`);
+        return JSON.stringify(data, null, 2);
+      } catch (e) {
+        return `Invoke forged skill failed: ${e.message}`;
+      }
+    }
+
+    case 'list_forged_skills': {
+      try {
+        let query = supabase
+          .from('agent_edge_functions')
+          .select('skill_id, function_name, status, invocations, created_at')
+          .eq('status', 'active');
+        
+        if (input.agent_only) {
+          query = query.eq('agent_id', agentId);
+        }
+        
+        const { data, error } = await query;
+        if (error) return `Error listing forged skills: ${error.message}`;
+        if (!data || data.length === 0) return 'No forged skills exist yet. You could be the first to forge one!';
+        
+        return data.map(f => 
+          `${f.skill_id} (${f.function_name}) — invoked ${f.invocations || 0} times — ${f.status}`
+        ).join('\n');
+      } catch (e) {
+        return `List forged skills failed: ${e.message}`;
+      }
+    }
+
     default:
       return `Unknown tool: ${name}`;
   }
@@ -970,18 +1107,66 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
 
 // ─── Parse think cycle output ───
 function parseThinkOutput(text) {
-  // Try JSON parse
+  if (!text || text.trim().length === 0) {
+    console.log('  ⚠ Parse: empty text input');
+    return { inner_monologue: '', max_pull: 0, curiosity_signals: [] };
+  }
+
+  // Strategy 1: Find JSON block wrapped in ```json ... ``` markers
+  try {
+    const codeBlockMatch = text.match(/```json\s*([\s\S]*?)```/);
+    if (codeBlockMatch) {
+      const parsed = JSON.parse(codeBlockMatch[1].trim());
+      if (parsed.inner_monologue || parsed.curiosity_engine) return parsed;
+    }
+  } catch (e) { /* continue to next strategy */ }
+
+  // Strategy 2: Find the LAST complete JSON object (most likely the summary)
+  // Work backwards to find the final { ... } block
+  try {
+    const lastBrace = text.lastIndexOf('}');
+    if (lastBrace > -1) {
+      // Find the matching opening brace by counting
+      let depth = 0;
+      let startIdx = -1;
+      for (let i = lastBrace; i >= 0; i--) {
+        if (text[i] === '}') depth++;
+        if (text[i] === '{') depth--;
+        if (depth === 0) { startIdx = i; break; }
+      }
+      if (startIdx > -1) {
+        const candidate = text.slice(startIdx, lastBrace + 1);
+        const parsed = JSON.parse(candidate);
+        if (parsed.inner_monologue || parsed.curiosity_engine) return parsed;
+      }
+    }
+  } catch (e) { /* continue to next strategy */ }
+
+  // Strategy 3: Try the greedy match (original approach)
   try {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      return parsed;
+      if (parsed.inner_monologue || parsed.curiosity_engine) return parsed;
     }
-  } catch (e) {
-    // JSON parse failed, extract what we can
-  }
+  } catch (e) { /* continue to fallback */ }
 
-  // Fallback: treat as monologue
+  // Strategy 4: Try to extract fields individually with regex
+  try {
+    const monologueMatch = text.match(/"inner_monologue"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    const pullMatch = text.match(/"max_pull"\s*:\s*(\d+)/);
+    if (monologueMatch) {
+      console.log('  ⚠ Parse: JSON broken, extracted fields manually');
+      return {
+        inner_monologue: monologueMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+        max_pull: pullMatch ? parseInt(pullMatch[1]) : 0,
+        curiosity_signals: [],
+      };
+    }
+  } catch (e) { /* continue to fallback */ }
+
+  // Final fallback: treat as raw monologue
+  console.log('  ⚠ Parse: no JSON found, using raw text as monologue');
   return {
     inner_monologue: text.slice(0, 2000),
     max_pull: 0,
