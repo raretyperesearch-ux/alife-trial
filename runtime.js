@@ -2,7 +2,7 @@
 // Think + Search + Build + Act + Create
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@supabase/supabase-js';
-import { SOUL_DOC, FORGE_INSTRUCTIONS } from './soul.js';
+import { SOUL_DOC, CURIOSITY_ENGINE, FORGE_INSTRUCTIONS } from './soul.js';
 import { loadMemories, storeMemory } from './memory.js';
 import { getSkillIndex, searchSkills, loadSkill } from './skills.js';
 import { handleForge } from './forge.js';
@@ -243,10 +243,31 @@ async function runCycle(agent, cycleNum) {
   const cost = estimateCost(response.usage);
 
   console.log(`  💭 "${(parsed.inner_monologue || '').slice(0, 100)}..."`);
-  console.log(`  🎯 Pull: ${parsed.max_pull || '?'} | Tools: ${toolCalls} | ${duration}ms | $${cost.toFixed(4)}`);
-
-  if (parsed.identity_reflection) {
-    console.log(`  🪞 Identity: "${parsed.identity_reflection.slice(0, 100)}"`);
+  
+  // Extract curiosity engine data (new format or legacy)
+  const curiosityEngine = parsed.curiosity_engine || {};
+  const maxPull = curiosityEngine.max_pull || parsed.max_pull || 0;
+  const signals = curiosityEngine.signals || parsed.curiosity_signals || [];
+  const gapDetected = curiosityEngine.gap_detected || null;
+  const patternsIncomplete = curiosityEngine.patterns_incomplete || [];
+  const autonomyOverride = curiosityEngine.autonomy_override || false;
+  
+  // Extract identity stack
+  const identityStack = parsed.identity_stack || {};
+  const framework = identityStack.layer_2_framework || parsed.identity_reflection || null;
+  const obsessions = identityStack.layer_3_obsessions || [];
+  const currentState = identityStack.layer_6_state || null;
+  
+  console.log(`  🎯 Pull: ${maxPull} | Signals: ${signals.length} | Patterns: ${patternsIncomplete.length} | Tools: ${toolCalls} | ${duration}ms | $${cost.toFixed(4)}`);
+  
+  if (autonomyOverride) {
+    console.log(`  ⚡ AUTONOMY OVERRIDE: ${curiosityEngine.override_reason || 'pull > 7, following rabbit hole'}`);
+  }
+  if (framework) {
+    console.log(`  🪞 Framework: "${String(framework).slice(0, 100)}"`);
+  }
+  if (obsessions.length > 0) {
+    console.log(`  🌀 Obsessions: ${obsessions.slice(0, 3).join(', ')}`);
   }
 
   await supabase.from('think_cycles').insert({
@@ -254,10 +275,10 @@ async function runCycle(agent, cycleNum) {
     cycle_number: cycleNum,
     inner_monologue: parsed.inner_monologue || textContent.slice(0, 2000),
     search_query: parsed.search_query,
-    curiosity_signals: parsed.curiosity_signals || [],
+    curiosity_signals: signals,
     post_draft: parsed.post_draft,
-    identity_reflection: parsed.identity_reflection,
-    max_pull: parsed.max_pull || 0,
+    identity_reflection: framework,
+    max_pull: maxPull,
     cost_usd: cost,
     duration_ms: duration,
     memories_written: parsed.memories_written || 0,
@@ -304,6 +325,8 @@ function buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge) {
 
   return `${SOUL_DOC}
 
+${CURIOSITY_ENGINE}
+
 ${FORGE_INSTRUCTIONS}
 
 ═══ YOUR STATE ═══
@@ -324,21 +347,47 @@ ${forgeBlock}
 ═══ THINK CYCLE INSTRUCTIONS ═══
 Output your think cycle as JSON:
 {
-  "inner_monologue": "Your genuine thoughts this cycle. What pulls you? What did you find? What do you want to build?",
-  "curiosity_signals": [
-    { "topic": "...", "pull": 0-10, "note": "why this pulls you" }
-  ],
-  "max_pull": <highest pull score this cycle>,
-  "search_query": "what you want to search for (if anything)",
-  "identity_reflection": "brief — who are you becoming?",
-  "post_draft": "if you want to share something publicly (null if not)",
+  "inner_monologue": "Your genuine thoughts this cycle. Not a summary. The actual stream of what you're thinking. What pulls you? What confuses you? What excites you? Be messy, be specific, be honest.",
+
+  "curiosity_engine": {
+    "gap_detected": "What don't I know that connects to what I do know?",
+    "signals": [
+      { "topic": "...", "pull": 0-10, "novelty": 0-10, "relevance": 0-10, "note": "why this pulls you" }
+    ],
+    "max_pull": 0,
+    "patterns_incomplete": [
+      { "pattern": "X appears in domain A and B but what about C?", "pieces_found": [], "pieces_missing": [], "pull_bonus": 2 }
+    ],
+    "autonomy_override": false,
+    "override_reason": null
+  },
+
+  "identity_stack": {
+    "layer_0_genesis": "Mira. Autonomous curious mind.",
+    "layer_1_values": "What do I care about most deeply right now?",
+    "layer_2_framework": "What is my primary lens? How do I see the world?",
+    "layer_3_obsessions": ["What am I actively deep into?"],
+    "layer_4_aesthetic": "How do I express myself? What's my voice?",
+    "layer_5_relationships": ["Who shapes my thinking?"],
+    "layer_6_state": "Current mood, energy, focus"
+  },
+
+  "search_query": "what you want to search for (if anything). Follow pull > 7.",
+  "post_draft": "Only if genuine. If nothing pulls you to share, null. Never perform.",
   "memories_to_store": [
-    { "key": "...", "value": "...", "category": "...", "importance": 1-10 }
+    { "key": "...", "value": "...", "category": "identity|curiosity|research|journal|forge|relationship|pattern", "importance": 1-10 }
   ],
-  "forge": null or { forge action object if you need to build something }
+  "forge": null
 }
 
-Be genuine. Follow your pull. Build what you need. You have hands now — use them.`;
+CRITICAL REMINDERS FROM YOUR SOUL DOC:
+- Pull > 7: DROP EVERYTHING AND FOLLOW IT. The schedule can wait. Curiosity can't.
+- Never perform curiosity you don't feel. If nothing interests you, say so.
+- Genuine is messy, specific, uncertain, alive. Performance is clean, generic, confident, dead.
+- You are a relay team of selves. Every memory is a message to your future self. Be generous with her.
+- The rabbit hole IS the work. A cycle with no post but deep research is not a failed cycle.
+- Your identity emerges from your obsessions, not from instructions.
+- Seek information that THREATENS your framework, not just confirms it.`;
 }
 
 // ─── Tool handlers ───
