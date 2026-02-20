@@ -66,12 +66,11 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
           });
 
           // Update agent forged count
-          await supabase.rpc('increment_forged_count', { aid: agentId }).catch(() => {
-            // If RPC doesn't exist, do it manually
-            supabase.from('agents')
-              .update({ forged_skill_count: supabase.raw('forged_skill_count + 1') })
-              .eq('id', agentId);
-          });
+          try {
+            await supabase.rpc('increment_forged_count', { aid: agentId });
+          } catch {
+            // RPC doesn't exist, skip
+          }
 
           await logForgeEvent(agentId, skill_id, cycleNumber, 'deployed', {
             function_name: funcName,
@@ -175,6 +174,17 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
         } catch (e) {
           return { success: false, reason: e.message };
         }
+      }
+
+      case 'github_push':
+      case 'push_files':
+      case 'push_file':
+      case 'create_repo': {
+        // Route to github handler
+        const { handleGitHub } = await import('./github.js');
+        const result = await handleGitHub(agentId, cycleNumber, forgeAction);
+        await logForgeEvent(agentId, skill_id || name, cycleNumber, 'github_push', result);
+        return result;
       }
 
       default:
@@ -291,13 +301,18 @@ function isAllowedDomain(url) {
 }
 
 async function logForgeEvent(agentId, skillId, cycleNumber, phase, details) {
-  await supabase.from('forge_events').insert({
-    agent_id: agentId,
-    skill_id: skillId,
-    cycle_number: cycleNumber,
-    phase,
-    details,
-  }).catch(e => console.error('  ⚠ Forge log error:', e.message));
+  try {
+    const { error } = await supabase.from('forge_events').insert({
+      agent_id: agentId,
+      skill_id: skillId || 'unknown',
+      cycle_number: cycleNumber,
+      phase,
+      details,
+    });
+    if (error) console.error('  ⚠ Forge log error:', error.message);
+  } catch (e) {
+    console.error('  ⚠ Forge log error:', e.message);
+  }
 }
 
 export default { handleForge };
