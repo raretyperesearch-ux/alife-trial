@@ -228,6 +228,19 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'discover_skills',
+    description: 'Browse the shared skill ecosystem. Find trending forged tools, get personalized recommendations, search by keyword, or check ecosystem stats. This is how you discover what other agents have built.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['trending', 'discover', 'search', 'ecosystem_stats'], description: 'trending: most used skills. discover: skills recommended for YOU. search: find by keyword. ecosystem_stats: overall health.' },
+        query: { type: 'string', description: 'Search query (for search action)' },
+        limit: { type: 'number', description: 'Max results (default 5)' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 // ─── Main loop ───
@@ -1076,7 +1089,7 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
       const SUPA_URL = process.env.SUPABASE_URL;
       const SUPA_KEY = process.env.SUPABASE_KEY;
       try {
-        const resp = await fetch(`${SUPA_URL}/functions/v1/forge-invoke?skill=${input.skill_id}`, {
+        const resp = await fetch(`${SUPA_URL}/functions/v1/forge-invoke?skill=${input.skill_id}&agent=${agentId}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1085,10 +1098,46 @@ async function handleToolCall(agentId, cycleNum, toolUse) {
           body: JSON.stringify(input.input || {}),
         });
         const data = await resp.json();
-        console.log(`  🔧 Invoked forged skill: ${input.skill_id} — ${data.success ? '✅' : '❌'}`);
+        console.log(`  🔧 Invoked forged skill: ${input.skill_id} — ${data.success ? '✅' : '❌'} (${data.latency_ms || '?'}ms)`);
         return JSON.stringify(data, null, 2);
       } catch (e) {
         return `Invoke forged skill failed: ${e.message}`;
+      }
+    }
+
+    case 'discover_skills': {
+      const SUPA_URL = process.env.SUPABASE_URL;
+      const SUPA_KEY = process.env.SUPABASE_KEY;
+      try {
+        const payload = {
+          action: input.action,
+          agent_id: agentId,
+          limit: input.limit || 5,
+        };
+        if (input.query) payload.query = input.query;
+
+        const resp = await fetch(`${SUPA_URL}/functions/v1/skill-discovery`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${SUPA_KEY}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        
+        if (input.action === 'ecosystem_stats') {
+          return `Ecosystem: ${data.total_forged_skills} forged skills, ${data.invocations_24h} invocations in 24h, ${data.active_builders} active builders`;
+        }
+        
+        const items = data.skills || data.recommendations || data.results || [];
+        if (items.length === 0) return 'No forged skills found yet. You could be the first to forge one!';
+        
+        return items.map(s => 
+          `${s.id || s.skill_id}: ${s.name || s.skill_name} — ${s.description || ''}${s.total_invocations ? ` (${s.total_invocations} uses)` : ''}${s.avg_rating ? ` ★${s.avg_rating.toFixed(1)}` : ''}`
+        ).join('\n');
+      } catch (e) {
+        return `Skill discovery failed: ${e.message}`;
       }
     }
 
