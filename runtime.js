@@ -3,7 +3,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@supabase/supabase-js';
 import { SOUL_DOC, CURIOSITY_ENGINE, FORGE_INSTRUCTIONS } from './soul.js';
-import { loadMemories, storeMemory, recallMemory, shouldReflect, buildReflectionPrompt, writeIdentityDoc } from './memory.js';
+import { loadMemories, storeMemory, recallMemory, shouldReflect, buildReflectionPrompt, writeIdentityDoc, shouldRunMaintenance, runDecay, runConsolidation, backfillEmbeddings } from './memory.js';
 import { getSkillIndex, searchSkills, loadSkill } from './skills.js';
 import { handleForge } from './forge.js';
 import { handleGitHub } from './github.js';
@@ -255,6 +255,10 @@ async function main() {
   let cycleNum = agent.total_cycles || 0;
   console.log(`Starting from cycle ${cycleNum}\n`);
 
+  // Backfill embeddings for any memories missing them
+  console.log('  🧠 Checking for memories needing embeddings...');
+  await backfillEmbeddings(agent.id).catch(e => console.error('  ⚠ Backfill error:', e.message));
+
   while (cycleNum < MAX_CYCLES) {
     cycleNum++;
     console.log(`\n╔══ CYCLE ${cycleNum} ══════════════════════════╗`);
@@ -276,6 +280,17 @@ async function main() {
       total_cycles: cycleNum,
       last_active: new Date().toISOString(),
     }).eq('id', AGENT_ID);
+
+    // Run memory maintenance every 20 cycles
+    if (shouldRunMaintenance(cycleNum)) {
+      console.log('  🔧 Running memory maintenance...');
+      try {
+        await runDecay(AGENT_ID, cycleNum);
+        await runConsolidation(AGENT_ID, cycleNum);
+      } catch (e) {
+        console.error('  ⚠ Maintenance error:', e.message);
+      }
+    }
 
     console.log(`╚══ CYCLE ${cycleNum} COMPLETE ═══════════════════╝\n`);
     await sleep(CYCLE_DELAY_MS);
