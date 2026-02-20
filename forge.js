@@ -1,5 +1,6 @@
 // forge.js — Skill Forge for ALiFe v2
 // Handles: gap detection → planning → building → deploying → testing
+// Now with REAL deployment via forge-deployer edge function
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -16,7 +17,7 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
   console.log(`  🔨 FORGE: ${action} — ${label}`);
 
   // Log every forge event
-  await logForgeEvent(agentId, skill_id, cycleNumber, 'attempt', { action, description });
+  await logForgeEvent(agentId, label, cycleNumber, 'attempt', { action, description });
 
   try {
     switch (action) {
@@ -32,67 +33,80 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
         const safetyCheck = scanCodeSafety(code);
         if (!safetyCheck.safe) {
           console.log(`  🚫 Forge blocked: ${safetyCheck.reason}`);
-          await logForgeEvent(agentId, skill_id, cycleNumber, 'blocked', { reason: safetyCheck.reason });
+          await logForgeEvent(agentId, label, cycleNumber, 'blocked', { reason: safetyCheck.reason });
           return { success: false, reason: safetyCheck.reason };
         }
 
-        // Deploy via Supabase Management API
-        const funcName = `agent-${skill_id}`;
-        const deployed = await deployFunction(funcName, code);
+        // Deploy via forge-deployer edge function (REAL DEPLOYMENT)
+        const funcName = `forged-${skill_id}`;
+        const deployed = await deployFunction(agentId, skill_id, name, description, code, env_vars_needed);
 
         if (deployed.success) {
-          // Register skill
-          await supabase.from('skills').upsert({
-            id: skill_id,
-            name: name || skill_id,
-            description: description || '',
-            domain: 'forged',
-            full_doc: code,
-            forged: true,
-            created_by: agentId,
-            created_at_cycle: cycleNumber,
-            implementation_type: 'edge_function',
+          await logForgeEvent(agentId, label, cycleNumber, 'deployed', {
             function_name: funcName,
-            word_count: code.split(' ').length,
-          }, { onConflict: 'id' });
-
-          // Store in agent edge functions
-          await supabase.from('agent_edge_functions').insert({
-            agent_id: agentId,
-            skill_id,
-            function_name: funcName,
-            code,
-            status: 'active',
-            env_vars_needed: env_vars_needed || [],
+            callable_url: deployed.callable_url,
+            code_length: code.length,
           });
+
+          console.log(`  ✅ FORGED: ${funcName} deployed`);
+          console.log(`  🔗 Callable at: ${deployed.callable_url}`);
 
           // Update agent forged count
           try {
             await supabase.rpc('increment_forged_count', { aid: agentId });
           } catch {
-            // RPC doesn't exist, skip
+            const { data: agent } = await supabase.from('agents').select('forged_skill_count').eq('id', agentId).single();
+            if (agent) {
+              await supabase.from('agents').update({ forged_skill_count: (agent.forged_skill_count || 0) + 1 }).eq('id', agentId);
+            }
           }
-
-          await logForgeEvent(agentId, skill_id, cycleNumber, 'deployed', {
-            function_name: funcName,
-            code_length: code.length,
-          });
-
-          console.log(`  ✅ FORGED: ${funcName} deployed`);
 
           // Run test if provided
           if (test) {
-            const testResult = await testFunction(funcName, test);
-            await logForgeEvent(agentId, skill_id, cycleNumber,
+            const testResult = await testFunction(skill_id, test);
+            await logForgeEvent(agentId, label, cycleNumber,
               testResult.passed ? 'test_passed' : 'test_failed', testResult);
             console.log(`  🧪 Test: ${testResult.passed ? 'PASSED' : 'FAILED'}`);
           }
 
-          return { success: true, function_name: funcName };
+          return { success: true, function_name: funcName, callable_url: deployed.callable_url };
         } else {
-          await logForgeEvent(agentId, skill_id, cycleNumber, 'deploy_failed', deployed);
+          await logForgeEvent(agentId, label, cycleNumber, 'deploy_failed', deployed);
           console.log(`  ❌ Deploy failed: ${deployed.error}`);
           return { success: false, reason: deployed.error };
+        }
+      }
+
+      case 'invoke_forged': {
+        // Call a previously forged function
+        const { target_skill: targetSkill, input } = forgeAction;
+        if (!targetSkill) return { success: false, reason: 'no target_skill' };
+        
+        const result = await invokeForgedFunction(targetSkill, input || {});
+        await logForgeEvent(agentId, label, cycleNumber, result.success ? 'invoke_success' : 'invoke_failed', {
+          target_skill: targetSkill, result: JSON.stringify(result).slice(0, 500),
+        });
+        return result;
+      }
+
+      case 'list_forged_skills': {
+        // List all forged skills for this agent
+        try {
+          const resp = await fetch(`${SUPA_URL}/functions/v1/forge-deployer`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${SUPA_SERVICE_KEY}`,
+            },
+            body: JSON.stringify({ action: 'list', agent_id: agentId }),
+          });
+          const data = await resp.json();
+          await logForgeEvent(agentId, label, cycleNumber, 'list_success', {
+            count: data.functions?.length || 0,
+          });
+          return data;
+        } catch (e) {
+          return { success: false, reason: e.message };
         }
       }
 
@@ -100,7 +114,6 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
         const { sql } = forgeAction.implementation || {};
         if (!sql) return { success: false, reason: 'no sql' };
 
-        // Safety: only CREATE TABLE
         if (!isSafeDDL(sql)) {
           console.log('  🚫 Unsafe DDL blocked');
           return { success: false, reason: 'unsafe DDL' };
@@ -112,20 +125,22 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
           return { success: false, reason: error.message || 'DDL error' };
         }
 
-        await logForgeEvent(agentId, skill_id, cycleNumber, 'table_created', { sql });
+        await logForgeEvent(agentId, label, cycleNumber, 'table_created', { sql });
         console.log(`  ✅ Table created`);
         return { success: true };
       }
 
       case 'call_api': {
-        // Agent wants to call an external API it's discovered
         const { url, method, headers, body } = forgeAction.api_call || {};
         if (!url) return { success: false, reason: 'no url' };
 
-        // Safety: whitelist domains
         if (!isAllowedDomain(url)) {
           console.log(`  🚫 Domain not allowed: ${url}`);
-          return { success: false, reason: 'domain not allowed' };
+          return { 
+            success: false, 
+            reason: 'domain not allowed',
+            forge_hint: `Domain ${new URL(url).hostname} is not in the allowlist. You can forge an edge function that wraps this API — deploy it via deploy_edge_function and then call it through invoke_forged.`,
+          };
         }
 
         try {
@@ -135,7 +150,7 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
             body: body ? JSON.stringify(body) : undefined,
           });
           const data = await resp.json().catch(() => resp.text());
-          await logForgeEvent(agentId, skill_id, cycleNumber, 'api_called', { url, status: resp.status });
+          await logForgeEvent(agentId, label, cycleNumber, 'api_called', { url, status: resp.status });
           return { success: true, data };
         } catch (e) {
           return { success: false, reason: e.message };
@@ -143,16 +158,13 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       }
 
       case 'post_bounty': {
-        // Agent wants to post a bounty for human help
         const { task, payment, platform } = forgeAction.bounty || {};
-        await logForgeEvent(agentId, skill_id, cycleNumber, 'bounty_posted', { task, payment, platform });
-        // For now, just log it. Real posting comes with Farcaster integration
+        await logForgeEvent(agentId, label, cycleNumber, 'bounty_posted', { task, payment, platform });
         console.log(`  📋 Bounty logged: "${task}" (${payment})`);
         return { success: true, logged: true, note: 'Bounty logged, Farcaster posting not yet active' };
       }
 
       case 'search_github': {
-        // Agent wants to find open source tools
         const { query } = forgeAction;
         if (!query) return { success: false, reason: 'no query' };
 
@@ -170,7 +182,7 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
             url: r.html_url,
             language: r.language,
           }));
-          await logForgeEvent(agentId, skill_id, cycleNumber, 'github_searched', { query, results: repos.length });
+          await logForgeEvent(agentId, label, cycleNumber, 'github_searched', { query, results: repos.length });
           return { success: true, repos };
         } catch (e) {
           return { success: false, reason: e.message };
@@ -181,10 +193,10 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
       case 'push_files':
       case 'push_file':
       case 'create_repo': {
-        // Route to github handler
         const { handleGitHub } = await import('./github.js');
         const result = await handleGitHub(agentId, cycleNumber, forgeAction);
-        await logForgeEvent(agentId, skill_id || name, cycleNumber, 'github_push', result);
+        await logForgeEvent(agentId, label, cycleNumber, 'github_push', result);
+        console.log(`  ${result.success ? '✅' : '❌'} GitHub: ${JSON.stringify(result).slice(0, 120)}`);
         return result;
       }
 
@@ -194,44 +206,70 @@ export async function handleForge(agentId, cycleNumber, forgeAction) {
     }
   } catch (err) {
     console.error(`  ❌ Forge error:`, err.message);
-    await logForgeEvent(agentId, skill_id, cycleNumber, 'error', { error: err.message });
+    await logForgeEvent(agentId, label, cycleNumber, 'error', { error: err.message });
     return { success: false, reason: err.message };
   }
 }
 
 /**
- * Deploy an edge function to Supabase
+ * Deploy an edge function via the forge-deployer edge function (REAL)
  */
-async function deployFunction(name, code) {
-  // Wrap code in standard Deno.serve pattern if not already
+async function deployFunction(agentId, skillId, name, description, code, envVarsNeeded) {
   let finalCode = code;
-  if (!code.includes('Deno.serve')) {
-    finalCode = `import "jsr:@supabase/functions-js/edge-runtime.d.ts";\n\n${code}`;
+  if (!code.includes('Deno.serve') && !code.includes('export default')) {
+    finalCode = `// Forged by agent: ${agentId}\n// Skill: ${skillId} — ${name || ''}\n// ${description || ''}\n\nexport default async function(input, ctx) {\n${code}\n}`;
   }
 
   try {
-    // Use Supabase Management API to deploy
-    // For now, store the code and mark as ready — manual deploy needed
-    // TODO: Use Supabase CLI or Management API for auto-deploy
-    return { success: true, note: 'Code stored, auto-deploy pending CLI integration' };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
-async function testFunction(funcName, testInput) {
-  try {
-    const url = `${SUPA_URL}/functions/v1/${funcName}`;
-    const resp = await fetch(url, {
+    const resp = await fetch(`${SUPA_URL}/functions/v1/forge-deployer`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${SUPA_SERVICE_KEY}`,
       },
-      body: JSON.stringify(testInput),
+      body: JSON.stringify({
+        action: 'deploy',
+        skill_id: skillId,
+        name,
+        description,
+        code: finalCode,
+        agent_id: agentId,
+        env_vars_needed: envVarsNeeded || [],
+      }),
     });
-    const data = await resp.json().catch(() => ({}));
-    return { passed: resp.ok, status: resp.status, data };
+
+    const data = await resp.json();
+    return data;
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Invoke a forged function
+ */
+async function invokeForgedFunction(skillId, input) {
+  try {
+    const resp = await fetch(`${SUPA_URL}/functions/v1/forge-invoke?skill=${skillId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPA_SERVICE_KEY}`,
+      },
+      body: JSON.stringify(input),
+    });
+
+    const data = await resp.json();
+    return data;
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+async function testFunction(skillId, testInput) {
+  try {
+    const result = await invokeForgedFunction(skillId, testInput);
+    return { passed: result.success, ...result };
   } catch (e) {
     return { passed: false, error: e.message };
   }
@@ -258,7 +296,6 @@ function scanCodeSafety(code) {
     }
   }
 
-  // Size limit: 50KB of code
   if (code.length > 50000) {
     return { safe: false, reason: 'code too large (max 50KB)' };
   }
@@ -268,9 +305,7 @@ function scanCodeSafety(code) {
 
 function isSafeDDL(sql) {
   const upper = sql.toUpperCase().trim();
-  // Only allow CREATE TABLE and CREATE INDEX
   if (!upper.startsWith('CREATE TABLE') && !upper.startsWith('CREATE INDEX')) return false;
-  // Block modifications to system tables
   const systemTables = ['agents', 'skills', 'think_cycles', 'memories', 'posts', 'forge_events'];
   for (const t of systemTables) {
     if (upper.includes(t.toUpperCase())) return false;
@@ -289,7 +324,7 @@ const ALLOWED_DOMAINS = [
   'api.neynar.com',
   'api.coingecko.com',
   'api.dexscreener.com',
-  'api.openai.com', // for DALL-E if needed
+  'api.openai.com',
 ];
 
 function isAllowedDomain(url) {
