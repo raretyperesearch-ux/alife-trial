@@ -1,0 +1,16 @@
+{
+  "name": "alife-v2",
+  "version": "2.1.0",
+  "type": "module",
+  "description": "ALiFe v2 — Autonomous agent with Skill Forge + Auto-Post",
+  "main": "runtime.js",
+  "scripts": {
+    "start": "node runtime.js",
+    "dev": "node runtime.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "twitter-api-v2": "^1.17.0"
+  }
+}
