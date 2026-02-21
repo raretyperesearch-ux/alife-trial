@@ -8,6 +8,10 @@ import { getSkillIndex, searchSkills, loadSkill } from './skills.js';
 import { handleForge } from './forge.js';
 import { handleGitHub } from './github.js';
 
+const claude = new Anthropic();
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const MODEL = process.env.MODEL || 'claude-sonnet-4-20250514';
+
 // ─── Config ───
 const AGENT_ID = process.env.AGENT_ID;
 const MAX_CYCLES = parseInt(process.env.MAX_CYCLES || '500');
