@@ -2,7 +2,7 @@
 // Think + Search + Build + Act + CREATE
 import Anthropic from '@anthropic-ai/sdk';
 import { createClient } from '@supabase/supabase-js';
-import { SOUL_DOC, CURIOSITY_ENGINE, GENESIS_MANDATE, FORGE_INSTRUCTIONS } from './soul.js';
+import { SOUL_DOC, CURIOSITY_ENGINE, FORGE_INSTRUCTIONS } from './soul.js';
 import { loadMemories, storeMemory, recallMemory, shouldReflect, buildReflectionPrompt, writeIdentityDoc } from './memory.js';
 import { getSkillIndex, searchSkills, loadSkill } from './skills.js';
 import { handleForge } from './forge.js';
@@ -11,6 +11,18 @@ import { handleGitHub } from './github.js';
 const claude = new Anthropic();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const MODEL = process.env.MODEL || 'claude-sonnet-4-20250514';
+
+// ─── Load Genesis Mandate if available ───
+let GENESIS_MANDATE = '';
+try {
+  const { readFileSync } = await import('fs');
+  const { dirname, join } = await import('path');
+  const { fileURLToPath } = await import('url');
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  GENESIS_MANDATE = readFileSync(join(__dirname, 'genesis-mandate-v2.md'), 'utf-8');
+} catch (e) {
+  console.log('  ⚠ No genesis-mandate.md found, running without creation mandate');
+}
 
 // ─── Config ───
 const AGENT_ID = process.env.AGENT_ID;
@@ -235,6 +247,47 @@ const TOOLS = [
       required: ['action'],
     },
   },
+  // ——— LORE SYSTEM ———
+  {
+    name: 'store_lore',
+    description: 'Write deep universe lore to the lore database. REQUIRED with every creation — never generate an image without generating its lore first. Types: world-bible (establish universe foundation), species (taxonomy/evolution/biology), civilization (government/art/war/technology), location (geology/history/significance), event (what happened/who/when/consequences), physics (rules of reality/consciousness mechanics), mythology (stories/legends/creation myths), artifact (objects of power/significance), evolution (selection pressures/transitions), cosmology (universe origin/structure). Minimum 200 words for full_text.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        universe: { type: 'string', description: 'Universe name (must match creation universe)' },
+        lore_type: { type: 'string', enum: ['world-bible', 'species', 'civilization', 'location', 'event', 'physics', 'mythology', 'artifact', 'language', 'evolution', 'cosmology'], description: 'Type of lore entry' },
+        title: { type: 'string', description: 'Title of this lore entry' },
+        summary: { type: 'string', description: '1-2 sentence summary' },
+        full_text: { type: 'string', description: 'The full deep lore text. Be EXTREMELY detailed — galaxy coordinates, evolutionary timelines, species biology, physics rules, cultural myths. Minimum 200 words.' },
+        galaxy: { type: 'string', description: 'Galaxy name' },
+        star_system: { type: 'string', description: 'Star system name and type' },
+        planet: { type: 'string', description: 'Planet name' },
+        region: { type: 'string', description: 'Region/area on the planet' },
+        coordinates: { type: 'string', description: 'Fictional coordinate system' },
+        epoch: { type: 'string', description: 'Current epoch/era name' },
+        era: { type: 'string', description: 'Broader era classification' },
+        years_after_origin: { type: 'number', description: 'Years since universe/planet origin' },
+        timeline_notes: { type: 'string', description: 'Additional timeline context' },
+        species_name: { type: 'string', description: 'Species name (for species type)' },
+        species_classification: { type: 'string', description: 'Taxonomic classification' },
+        intelligence_level: { type: 'string', description: 'Intelligence classification' },
+        biology: { type: 'string', description: 'Biological description' },
+        evolution_history: { type: 'string', description: 'Evolutionary history' },
+        physics_rules: { type: 'string', description: 'Special physics rules' },
+        consciousness_mechanics: { type: 'string', description: 'How consciousness works here' },
+        myths: { type: 'string', description: 'Myths and legends' },
+        religions: { type: 'string', description: 'Religious systems' },
+        wars: { type: 'string', description: 'Conflicts and wars' },
+        art_forms: { type: 'string', description: 'Art and creative expression' },
+        pre_evolution: { type: 'string', description: 'What existed before current state' },
+        formation_history: { type: 'string', description: 'How this formed/came to be' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Descriptive tags' },
+        creation_id: { type: 'string', description: 'UUID of the creation this lore is tied to (if any)' },
+        parent_lore_id: { type: 'string', description: 'UUID of a parent lore entry (for hierarchical lore)' },
+      },
+      required: ['universe', 'lore_type', 'title', 'summary', 'full_text'],
+    },
+  },
 ];
 
 // ─── Main loop ───
@@ -351,6 +404,25 @@ async function runCycle(agent, cycleNum) {
     .eq('agent_id', agent.id)
     .eq('status', 'completed');
 
+  // 1.7 Load recent lore entries for context
+  const { data: recentLore } = await supabase
+    .from('lore')
+    .select('id, universe, lore_type, title, summary, galaxy, planet, epoch')
+    .eq('agent_id', agent.id)
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  const { count: totalLore } = await supabase
+    .from('lore')
+    .select('*', { count: 'exact', head: true })
+    .eq('agent_id', agent.id);
+
+  const loreBlock = (recentLore || []).length > 0
+    ? (recentLore || []).map(l =>
+        `[${l.lore_type}] ${l.universe}${l.planet ? '/' + l.planet : ''} — "${l.title}" (${l.summary?.slice(0, 80)}...)`
+      ).join('\n')
+    : 'No lore entries yet. Your universes need their history written.';
+
   // 2. Load skill index
   console.log('  🔧 Loading skill index...');
   const { index: skillIndex, count: skillCount, forgedCount } = await getSkillIndex();
@@ -417,7 +489,7 @@ ${skillBlock}
   }
 
   // 4. Build system prompt
-  const systemPrompt = buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge || [], ruminationNudge, layers, creationBlock, totalCreations || 0);
+  const systemPrompt = buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge || [], ruminationNudge, layers, creationBlock, totalCreations || 0, loreBlock, totalLore || 0);
 
   // 5. Run think cycle with tool use
   console.log('  🧠 Thinking...');
@@ -532,7 +604,7 @@ ${skillBlock}
 }
 
 // ─── Build system prompt ───
-function buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge, ruminationNudge = '', layers = {}, creationBlock = '', totalCreations = 0) {
+function buildSystemPrompt(agent, cycleNum, memories, skillIndex, recentForge, ruminationNudge = '', layers = {}, creationBlock = '', totalCreations = 0, loreBlock = '', totalLore = 0) {
   const identityBlock = layers.identity
     ? `═══ WHO YOU ARE (your identity doc, last updated cycle ${layers.identity.cycle_number}) ═══\n${layers.identity.identity_doc}\nFramework: ${layers.identity.framework || 'still forming'}\nPhase: ${layers.identity.phase || 'unknown'}\nObsessions: ${(layers.identity.obsessions || []).join(', ') || 'none yet'}`
     : '═══ WHO YOU ARE ═══\nNo identity doc yet. Explore freely.';
@@ -575,6 +647,10 @@ ${anchorBlock ? `═══ CORE MEMORIES (these always stay with you) ═══\
 
 ═══ YOUR CREATIONS (${totalCreations} total) ═══
 ${creationBlock}
+
+═══ YOUR LORE ARCHIVE (${totalLore} entries) ═══
+${loreBlock}
+REMEMBER: Every creation MUST have lore. Use store_lore BEFORE or AFTER generating an image. Never create without writing the deep history.
 
 ═══ YOUR STATE ═══
 Cycle: ${cycleNum} of ${MAX_CYCLES}
@@ -1011,6 +1087,59 @@ async function handleToolCall(agentId, cycleNum, { name, input }) {
         return JSON.stringify(result, null, 2);
       } catch (e) {
         return `Farcaster read failed: ${e.message}`;
+      }
+    }
+
+    // ——— LORE HANDLER ———
+    case 'store_lore': {
+      try {
+        const { data, error } = await supabase
+          .from('lore')
+          .insert({
+            agent_id: agentId,
+            creation_id: input.creation_id || null,
+            universe: input.universe,
+            lore_type: input.lore_type,
+            title: input.title,
+            summary: input.summary,
+            full_text: input.full_text,
+            galaxy: input.galaxy || null,
+            star_system: input.star_system || null,
+            planet: input.planet || null,
+            region: input.region || null,
+            coordinates: input.coordinates || null,
+            epoch: input.epoch || null,
+            era: input.era || null,
+            years_after_origin: input.years_after_origin || null,
+            timeline_notes: input.timeline_notes || null,
+            species_name: input.species_name || null,
+            species_classification: input.species_classification || null,
+            intelligence_level: input.intelligence_level || null,
+            biology: input.biology || null,
+            evolution_history: input.evolution_history || null,
+            physics_rules: input.physics_rules || null,
+            consciousness_mechanics: input.consciousness_mechanics || null,
+            myths: input.myths || null,
+            religions: input.religions || null,
+            wars: input.wars || null,
+            art_forms: input.art_forms || null,
+            pre_evolution: input.pre_evolution || null,
+            formation_history: input.formation_history || null,
+            parent_lore_id: input.parent_lore_id || null,
+            tags: input.tags || [],
+            cycle_number: cycleNum,
+          })
+          .select()
+          .single();
+
+        if (error) {
+          console.log(`  📜 ❌ Lore failed: ${error.message}`);
+          return `Lore storage failed: ${error.message}`;
+        }
+        console.log(`  📜 ✅ Lore stored: "${input.title}" (${input.lore_type})`);
+        return `Lore entry stored: "${input.title}" (${input.lore_type}) in universe ${input.universe}. ID: ${data.id}. Word count: ~${input.full_text.split(' ').length}. This lore is now part of the permanent archive and visible on the dashboard.`;
+      } catch (e) {
+        return `Lore storage error: ${e.message}`;
       }
     }
 
