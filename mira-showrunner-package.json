@@ -1,0 +1,19 @@
+{
+  "name": "mira-showrunner",
+  "version": "1.0.0",
+  "description": "Mira Studio - Autonomous content studio orchestrator",
+  "main": "mira-showrunner.js",
+  "type": "module",
+  "scripts": {
+    "start": "node mira-showrunner.js",
+    "dev": "node --watch mira-showrunner.js",
+    "test-cycle": "node -e \"import('./mira-showrunner.js').then(m => m.runCycle())\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
